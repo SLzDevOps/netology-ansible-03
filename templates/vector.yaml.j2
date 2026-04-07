@@ -1,0 +1,20 @@
+---
+sources:
+  demo_logs:
+    type: demo_logs
+    format: json
+    interval: 1
+
+sinks:
+  clickhouse_sink:
+    type: clickhouse
+    inputs:
+      - demo_logs
+    database: logs
+    table: vector_logs
+    endpoint: http://<clickhouse_ip>:8123
+    compression: gzip
+    encoding:
+      codec: json
+    batch:
+      max_events: 1000

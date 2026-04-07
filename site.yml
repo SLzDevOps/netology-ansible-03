@@ -1,0 +1,217 @@
+---
+# Play 1: Установка Clickhouse
+- name: Install Clickhouse
+  hosts: clickhouse
+  become: true
+  handlers:
+    - name: Restart clickhouse service
+      ansible.builtin.systemd:
+        name: clickhouse-server
+        state: restarted
+        daemon_reload: true
+        enabled: true
+
+  tasks:
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+        state: present
+        update_cache: yes
+
+    - name: Add Clickhouse GPG key
+      ansible.builtin.shell: |
+        curl -fsSL 'https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key' | gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg
+      args:
+        creates: /usr/share/keyrings/clickhouse-keyring.gpg
+
+    - name: Add Clickhouse repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg arch=amd64] https://packages.clickhouse.com/deb stable main"
+        state: present
+        update_cache: yes
+
+    - name: Install clickhouse packages
+      ansible.builtin.apt:
+        name:
+          - clickhouse-server
+          - clickhouse-client
+        state: present
+        update_cache: yes
+      notify: Restart clickhouse service
+
+    - name: Ensure clickhouse-server is started and enabled
+      ansible.builtin.systemd:
+        name: clickhouse-server
+        state: started
+        enabled: true
+      register: service_result
+
+    - name: Debug service status if failed
+      debug:
+        msg: "{{ service_result }}"
+      when: service_result.failed
+
+    - name: Wait for clickhouse to start
+      ansible.builtin.wait_for:
+        port: 8123
+        host: localhost
+        delay: 5
+        timeout: 60
+
+    - name: Create database
+      ansible.builtin.command:
+        cmd: clickhouse-client -q 'CREATE DATABASE IF NOT EXISTS logs;'
+      register: create_db
+      changed_when: false
+      failed_when: false
+
+
+# Play 2: Установка и настройка Vector
+- name: Install and configure Vector
+  hosts: vector
+  vars:
+    vector_version: "0.21.1"
+  handlers:
+    - name: Restart vector service
+      become: true
+      ansible.builtin.systemd:
+        name: vector
+        state: restarted
+        daemon_reload: true
+  tasks:
+    - name: Create vector working directory
+      become: true
+      ansible.builtin.file:
+        path: /opt/vector
+        state: directory
+        mode: '0755'
+
+    - name: Download vector distribution
+      become: true
+      ansible.builtin.get_url:
+        url: "https://packages.timber.io/vector/{{ vector_version }}/vector-{{ vector_version }}-x86_64-unknown-linux-gnu.tar.gz"
+        dest: "/tmp/vector-{{ vector_version }}.tar.gz"
+        timeout: 300
+
+    - name: Extract vector archive
+      become: true
+      ansible.builtin.unarchive:
+        src: "/tmp/vector-{{ vector_version }}.tar.gz"
+        dest: /opt/vector
+        remote_src: true
+        creates: /opt/vector/vector-x86_64-unknown-linux-gnu/bin/vector
+
+    - name: Create symlink to vector binary
+      become: true
+      ansible.builtin.file:
+        src: "/opt/vector/vector-x86_64-unknown-linux-gnu/bin/vector"
+        dest: /usr/local/bin/vector
+        state: link
+
+    - name: Create vector config directory
+      become: true
+      ansible.builtin.file:
+        path: /etc/vector
+        state: directory
+        mode: '0755'
+
+    - name: Deploy vector configuration from template
+      become: true
+      ansible.builtin.template:
+        src: vector.yaml.j2
+        dest: /etc/vector/vector.yaml
+        mode: '0644'
+      notify: Restart vector service
+
+    - name: Create vector systemd service file
+      become: true
+      ansible.builtin.template:
+        src: vector.service.j2
+        dest: /etc/systemd/system/vector.service
+        mode: '0644'
+      notify: Restart vector service
+
+    - name: Ensure vector service is started and enabled
+      become: true
+      ansible.builtin.systemd:
+        name: vector
+        state: started
+        enabled: true
+
+
+
+# Play 3: Установка и настройка Lighthouse
+- name: Install and configure Lighthouse
+  hosts: lighthouse
+  become: true
+  handlers:
+    - name: Restart nginx service
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+        daemon_reload: true
+
+  tasks:
+    - name: Install nginx and git
+      ansible.builtin.apt:
+        name:
+          - nginx
+          - git
+        state: present
+        update_cache: yes
+
+    - name: Ensure nginx is started and enabled
+      ansible.builtin.systemd:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: Remove old lighthouse directory if exists
+      ansible.builtin.file:
+        path: /var/www/lighthouse
+        state: absent
+
+    - name: Create directory for lighthouse
+      ansible.builtin.file:
+        path: /var/www/lighthouse
+        state: directory
+        mode: '0755'
+
+    - name: Clone Lighthouse repository
+      ansible.builtin.git:
+        repo: https://github.com/VKCOM/lighthouse.git
+        dest: /var/www/lighthouse
+        version: master
+
+    - name: Set proper permissions for lighthouse
+      ansible.builtin.file:
+        path: /var/www/lighthouse
+        state: directory
+        recurse: yes
+        owner: www-data
+        group: www-data
+        mode: '0755'
+
+    - name: Configure nginx site for lighthouse
+      ansible.builtin.template:
+        src: lighthouse_nginx.conf.j2
+        dest: /etc/nginx/sites-available/lighthouse
+        mode: '0644'
+      notify: Restart nginx service
+
+    - name: Enable lighthouse site
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/lighthouse
+        dest: /etc/nginx/sites-enabled/lighthouse
+        state: link
+      notify: Restart nginx service
+
+    - name: Remove default nginx site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Restart nginx service
